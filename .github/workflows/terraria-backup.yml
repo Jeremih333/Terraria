@@ -1,4 +1,4 @@
-name: Terraria world backup (SFTP -> rclone cloud)
+name: Terraria world backup (FreeGameHost.xyz)
 
 on:
   schedule:
@@ -9,42 +9,61 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
+
+      # ──────────────────────────────
+      # Установка зависимостей
       - name: Install dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y sshpass jq
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
+      # ──────────────────────────────
+      # Декод rclone конфигурации
       - name: Decode rclone config
         env:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
         run: |
-          if [ -z "${{ secrets.RCLONE_CONF }}" ]; then
-            echo "RCLONE_CONF secret is missing. Aborting."
+          if [ -z "$RCLONE_CONF_B64" ]; then
+            echo "❌ RCLONE_CONF secret missing"
             exit 1
           fi
-          echo "${{ secrets.RCLONE_CONF }}" | base64 -d > rclone.conf
+          echo "$RCLONE_CONF_B64" | base64 -d > rclone.conf
           chmod 600 rclone.conf
-          echo "rclone config written."
+          echo "✔ rclone configuration created"
 
-      - name: Trigger server save (send 'save' command)
+      # ──────────────────────────────
+      # Отправляем команду save на сервер
+      - name: Trigger server save
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
         run: |
           if [ -z "$PANEL_URL" ] || [ -z "$PANEL_API_KEY" ] || [ -z "$SERVER_ID" ]; then
-            echo "PANEL_URL / PANEL_API_KEY / SERVER_ID must be set as repository secrets"
+            echo "❌ PANEL_URL / PANEL_API_KEY / SERVER_ID must be set"
             exit 1
           fi
-          echo "Sending save command to server..."
-          curl -s -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
+
+          echo "➡ Sending save command to server..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
             -H "Authorization: Bearer $PANEL_API_KEY" \
             -H "Accept: application/vnd.pterodactyl.v1+json" \
             -H "Content-Type: application/json" \
-            -d '{"command":"save"}' || true
-          sleep 8
+            -d '{"command":"save"}')
 
+          if [[ "$HTTP_CODE" != "204" && "$HTTP_CODE" != "200" ]]; then
+            echo "⚠️ Save command returned HTTP $HTTP_CODE (not 200/204)"
+          else
+            echo "✔ Save command executed (HTTP $HTTP_CODE)"
+          fi
+
+          echo "⏳ Waiting 10 seconds to ensure world flush..."
+          sleep 10
+
+      # ──────────────────────────────
+      # SFTP: скачиваем мир
       - name: Download world files via SFTP
         env:
           SFTP_HOST: ${{ secrets.SFTP_HOST }}
@@ -54,44 +73,79 @@ jobs:
           REMOTE_WORLD_PATH: ${{ secrets.REMOTE_WORLD_PATH }}
         run: |
           if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USER" ] || [ -z "$REMOTE_WORLD_PATH" ]; then
-            echo "SFTP_HOST / SFTP_USER / REMOTE_WORLD_PATH required"
+            echo "❌ SFTP_HOST / SFTP_USER / REMOTE_WORLD_PATH required"
             exit 1
           fi
+
           WORKDIR="$(pwd)/world_backup_$(date +%s)"
           mkdir -p "$WORKDIR"
-          echo "Downloading world files into $WORKDIR"
+          echo "➡ Downloading world files to $WORKDIR"
+
           if [ -n "$SFTP_PASS" ]; then
-            sshpass -p "$SFTP_PASS" sftp -oBatchMode=no -oStrictHostKeyChecking=no -P ${SFTP_PORT:-22} ${SFTP_USER}@${SFTP_HOST} <<EOF
+            sshpass -p "$SFTP_PASS" sftp \
+              -oBatchMode=no \
+              -oStrictHostKeyChecking=no \
+              -P ${SFTP_PORT:-22} \
+              ${SFTP_USER}@${SFTP_HOST} <<EOF
 lcd $WORKDIR
 cd $REMOTE_WORLD_PATH
-mget *.wld *.wld.bak || true
+mget *.wld *.wld.bak
 bye
 EOF
           else
-            # If using private key auth, the repo must contain the PEM private key secret and this branch must be adapted.
-            echo "No SFTP password provided; this workflow currently expects SFTP password auth."
+            echo "❌ No SFTP password provided (private key not configured yet)"
             exit 1
           fi
+
+          echo "✔ Download finished"
           ls -la "$WORKDIR"
 
+          COUNT=$(ls "$WORKDIR"/*.wld 2>/dev/null | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ No .wld world files found — aborting"
+            exit 1
+          else
+            echo "✔ Found $COUNT world file(s)"
+          fi
+
+      # ──────────────────────────────
+      # Отправка в облако через rclone
       - name: Upload to cloud with rclone
         env:
           RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
         run: |
           if [ -z "$RCLONE_REMOTE_NAME" ]; then
-            echo "RCLONE_REMOTE_NAME secret is required (name of remote in rclone.conf)."
+            echo "❌ RCLONE_REMOTE_NAME secret is required"
             exit 1
           fi
-          WORKDIR=$(ls -td world_backup_* | head -n1)
-          TARGET="${RCLONE_REMOTE_NAME}:terraria-backups/${{ secrets.SERVER_ID }}/$(date +%F_%H-%M-%S)"
-          echo "Uploading $WORKDIR -> $TARGET"
-          rclone --config=rclone.conf copy "$WORKDIR" "$TARGET" --create-empty-src-dirs --transfers=4 --checkers=8 --no-traverse
-          echo "Upload finished."
 
-      - name: Prune old backups (optional)
+          WORKDIR=$(ls -td world_backup_* | head -n1)
+          if [ -z "$WORKDIR" ]; then
+            echo "❌ Could not find world backup folder"
+            exit 1
+          fi
+
+          ARCHIVE_PATH="${RCLONE_REMOTE_NAME}:terraria-backups/${{ secrets.SERVER_ID }}/archive/$(date +%F_%H-%M-%S)"
+          LATEST_PATH="${RCLONE_REMOTE_NAME}:terraria-backups/${{ secrets.SERVER_ID }}/latest"
+
+          echo "➡ Uploading to archive: $ARCHIVE_PATH"
+          rclone --config=rclone.conf copy "$WORKDIR" "$ARCHIVE_PATH" \
+            --create-empty-src-dirs --transfers=4 --checkers=8 --no-traverse
+
+          echo "➡ Updating latest backup"
+          rclone --config=rclone.conf sync "$WORKDIR" "$LATEST_PATH" \
+            --create-empty-src-dirs
+
+          echo "✔ Upload complete"
+
+      # ──────────────────────────────
+      # Очистка старых бэкапов (опционально)
+      - name: Prune old backups
         env:
           RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
         run: |
           KEEP_DAYS=30
-          echo "Deleting backups older than $KEEP_DAYS days"
-          rclone --config=rclone.conf delete ${RCLONE_REMOTE_NAME}:terraria-backups/${{ secrets.SERVER_ID }} --min-age ${KEEP_DAYS}d || true
+          ARCHIVE_DIR="${RCLONE_REMOTE_NAME}:terraria-backups/${{ secrets.SERVER_ID }}/archive"
+          echo "➡ Deleting backups older than $KEEP_DAYS days"
+          rclone --config=rclone.conf delete "$ARCHIVE_DIR" --min-age ${KEEP_DAYS}d || true
+          echo "✔ Prune done"
