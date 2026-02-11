@@ -59,7 +59,7 @@ jobs:
             sleep 8
           fi
 
-      - name: Direct copy SFTP -> Google Drive via rclone (auto-detect path)
+      - name: Direct copy SFTP -> Google Drive via rclone (auto-detect path, verbose)
         env:
           SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
           SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
@@ -102,7 +102,6 @@ jobs:
           printf "user = %s\n" "$SFTP_USER" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "port = %s\n" "${SFTP_PORT:-22}" >> "$GITHUB_WORKSPACE/rclone.conf"
 
-          # prefer SSH key if provided
           if [ -n "${SFTP_KEY:-}" ]; then
             echo "Using SSH private key auth (from secret TERRARIA_SFTP_KEY)"
             printf "%s\n" "$SFTP_KEY" > "$GITHUB_WORKSPACE/sftp_key.pem"
@@ -116,29 +115,35 @@ jobs:
             exit 1
           fi
 
-          # Try a list of candidate paths first (fast)
+          # candidate paths — расширенный набор
           CANDIDATES=(
             "${REMOTE_WORLD_PATH:-}"
             "/home/container/saves/Worlds"
-            "container/saves/Worlds"
-            "saves/Worlds"
-            "Worlds"
-            "/home/jeremih333.27c01087/Worlds"
+            "/home/container/saves"
             "/home/container"
+            "container/saves/Worlds"
+            "container/saves"
+            "saves/Worlds"
+            "saves"
+            "Worlds"
+            "world"
+            "/home/jeremih333.27c01087/Worlds"
+            "/home/jeremih333.27c01087"
             "/home"
             ""
           )
 
+          echo "DEBUG: root listing (what SFTP sees as root)"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:" || true
+
           FOUND=""
           for p in "${CANDIDATES[@]}"; do
-            # normalize empty to root
             if [ -z "$p" ]; then
               TRY=":"
             else
-              TRY="${p}"
+              TRY="$p"
             fi
             echo "Trying candidate path: '$p'"
-            # count matching files
             COUNT=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${TRY}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
             echo " -> matches: $COUNT"
             if [ "${COUNT:-0}" -gt 0 ]; then
@@ -147,9 +152,8 @@ jobs:
             fi
           done
 
-          # If still not found, perform recursive search (slower) and take first .wld file
           if [ -z "$FOUND" ]; then
-            echo "No candidates matched. Doing recursive search (may take a while)..."
+            echo "No candidate matched — performing recursive search (this may take a little while)..."
             FIRST_WLD_PATH=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsjson "sftp_tmp:" --recursive --files-only 2>/dev/null \
               | jq -r '.[] | select(.Path | test("\\.wld$")) | .Path' | head -n1 || true)
             if [ -n "$FIRST_WLD_PATH" ]; then
@@ -163,7 +167,6 @@ jobs:
 
           echo "Using found remote path: '$FOUND'"
 
-          # Count again for logging
           COUNT_FINAL=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${FOUND}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
           echo "Found $COUNT_FINAL .wld/.wld.bak files in $FOUND"
 
