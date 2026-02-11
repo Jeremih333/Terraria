@@ -83,8 +83,16 @@ jobs:
           fi
 
           echo "SFTP auth options present? (lengths will be shown, values are not revealed)"
-          echo "SFTP_PASS length: ${#SFTP_PASS:-0}"
-          echo "SFTP_KEY length: ${#SFTP_KEY:-0}"
+          if [ -n "${SFTP_PASS:-}" ]; then
+            echo "SFTP_PASS length: ${#SFTP_PASS}"
+          else
+            echo "SFTP_PASS not set"
+          fi
+          if [ -n "${SFTP_KEY:-}" ]; then
+            echo "SFTP_KEY length: ${#SFTP_KEY}"
+          else
+            echo "SFTP_KEY not set"
+          fi
 
           echo "Appending temporary sftp remote (sftp_tmp) to rclone.conf"
           printf "\n" >> "$GITHUB_WORKSPACE/rclone.conf"
