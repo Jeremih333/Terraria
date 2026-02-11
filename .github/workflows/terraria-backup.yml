@@ -3,7 +3,7 @@ name: Terraria world backup (FreeGameHost.xyz)
 on:
   schedule:
     - cron: '*/15 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
   backup:
@@ -21,6 +21,10 @@ jobs:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
         run: |
           set -euo pipefail
+          if [ -z "${RCLONE_CONF_B64:-}" ]; then
+            echo "❌ RCLONE_CONF secret missing"
+            exit 1
+          fi
           echo "$RCLONE_CONF_B64" | base64 -d > "$GITHUB_WORKSPACE/rclone.conf"
           chmod 600 "$GITHUB_WORKSPACE/rclone.conf"
           echo "✔️ rclone.conf ready"
@@ -32,20 +36,20 @@ jobs:
           SERVER_ID: ${{ secrets.SERVER_ID }}
           SKIP_SAVE: ${{ secrets.SKIP_SAVE }}
         run: |
-          set -euo pipefail || true
+          set -euo pipefail
           if [ "${SKIP_SAVE:-}" = "true" ]; then
-            echo "Skipping server save"
+            echo "SKIP_SAVE=true → skipping server save"
+          elif [ -n "${PANEL_URL:-}" ] && [ -n "${PANEL_API_KEY:-}" ] && [ -n "${SERVER_ID:-}" ]; then
+            echo "Issuing save command to panel..."
+            curl -s -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
+              -H "Authorization: Bearer $PANEL_API_KEY" \
+              -H "Accept: application/vnd.pterodactyl.v1+json" \
+              -H "Content-Type: application/json" \
+              -d '{"command":"save"}' || true
+            echo "Save command issued (if supported by panel)"
+            sleep 8
           else
-            if [ -n "${PANEL_URL:-}" ] && [ -n "${PANEL_API_KEY:-}" ] && [ -n "${SERVER_ID:-}" ]; then
-              curl -s -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
-                -H "Authorization: Bearer $PANEL_API_KEY" \
-                -H "Accept: application/vnd.pterodactyl.v1+json" \
-                -H "Content-Type: application/json" \
-                -d '{"command":"save"}' || true
-              echo "Save command issued"
-            else
-              echo "Panel API missing, skipping save"
-            fi
+            echo "Panel API not configured → skipping save"
           fi
 
       - name: SFTP backup: copy world files via rclone
@@ -60,7 +64,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # build a temporary rclone remote for SFTP
+          # validate required values
+          if [ -z "${SFTP_HOST:-}" ] || [ -z "${SFTP_USER:-}" ]; then
+            echo "❌ SFTP_HOST and SFTP_USER are required"
+            exit 1
+          fi
+          if [ -z "${RCLONE_REMOTE_NAME:-}" ] || [ -z "${SERVER_ID:-}" ]; then
+            echo "❌ RCLONE_REMOTE_NAME and SERVER_ID are required"
+            exit 1
+          fi
+          if [ -z "${REMOTE_WORLD_PATH:-}" ]; then
+            echo "❌ TERRARIA_WORLD_PATH is empty — set it to e.g. 'saves/Worlds'"
+            exit 1
+          fi
+
+          # append temporary sftp remote to rclone.conf
           printf "\n" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "[sftp_tmp]\n" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "type = sftp\n" >> "$GITHUB_WORKSPACE/rclone.conf"
@@ -69,21 +87,21 @@ jobs:
           printf "port = %s\n" "${SFTP_PORT:-22}" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "pass = %s\n" "$SFTP_PASS" >> "$GITHUB_WORKSPACE/rclone.conf"
 
-          echo "Listing world folder: $REMOTE_WORLD_PATH"
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}"
+          echo "DEBUG: list remote folder contents at sftp_tmp:${REMOTE_WORLD_PATH}"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}" || true
 
           ARCHIVE="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
           LATEST="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/latest"
 
-          echo "Uploading to archive: $ARCHIVE"
+          echo "Uploading world files to archive: $ARCHIVE"
           rclone --config="$GITHUB_WORKSPACE/rclone.conf" copy "sftp_tmp:${REMOTE_WORLD_PATH}" "$ARCHIVE" \
             --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs --transfers=4 --checkers=8 --progress
 
           echo "Syncing latest -> $LATEST"
           rclone --config="$GITHUB_WORKSPACE/rclone.conf" sync "sftp_tmp:${REMOTE_WORLD_PATH}" "$LATEST" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs
+            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs --progress
 
-      - name: Prune old backups
+      - name: Prune old backups (optional)
         env:
           RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
@@ -91,5 +109,6 @@ jobs:
           set -e || true
           KEEP_DAYS=30
           ARCHIVE_DIR="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive"
+          echo "Pruning backups older than $KEEP_DAYS days in $ARCHIVE_DIR"
           rclone --config="$GITHUB_WORKSPACE/rclone.conf" delete "$ARCHIVE_DIR" --min-age ${KEEP_DAYS}d || true
           echo "✔️ Pruned old backups"
