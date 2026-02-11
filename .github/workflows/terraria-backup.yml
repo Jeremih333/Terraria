@@ -20,21 +20,121 @@ jobs:
         env:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
         run: |
-          set -e
+          set -euo pipefail
           if [ -z "${RCLONE_CONF_B64:-}" ]; then
-            echo "RCLONE_CONF secret missing"
+            echo "❌ RCLONE_CONF secret missing"
             exit 1
           fi
-          echo "$RCLONE_CONF_B64" | base64 -d > rclone.conf
-          chmod 600 rclone.conf
+          echo "$RCLONE_CONF_B64" | base64 -d > "$GITHUB_WORKSPACE/rclone.conf"
+          chmod 600 "$GITHUB_WORKSPACE/rclone.conf"
+          echo "✔️ rclone.conf written"
 
-      - name: Trigger server save
+      - name: Trigger server save (optional, won't fail entire job)
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
+          SKIP_SAVE: ${{ secrets.SKIP_SAVE }}
         run: |
-          set -e
+          set -euo pipefail || true
+          if [ "${SKIP_SAVE:-}" = "true" ]; then
+            echo "SKIP_SAVE=true → skipping panel save"
+          elif [ -z "${PANEL_URL:-}" ] || [ -z "${PANEL_API_KEY:-}" ] || [ -z "${SERVER_ID:-}" ]; then
+            echo "Panel secrets not fully set → skipping save"
+          else
+            echo "Calling: $PANEL_URL/api/client/servers/$SERVER_ID/command"
+            HTTP_CODE=$(curl -s -o panel_response.json -w "%{http_code}" \
+              -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
+              -H "Authorization: Bearer $PANEL_API_KEY" \
+              -H "Accept: application/vnd.pterodactyl.v1+json" \
+              -H "Content-Type: application/json" \
+              -d '{"command":"save"}' || true)
+            echo "HTTP code: $HTTP_CODE"
+            echo "Panel response:"
+            cat panel_response.json || true
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+              echo "Save command accepted"
+            else
+              echo "Save returned $HTTP_CODE — continuing to SFTP download"
+            fi
+            sleep 8
+          fi
+
+      - name: Download world via SFTP (mirror .wld)
+        env:
+          SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
+          SFTP_USER: ${{ secrets.TERRARIA_SFTP_USER }}
+          SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
+          REMOTE_WORLD_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SFTP_HOST:-}" ] || [ -z "${SFTP_USER:-}" ] || [ -z "${REMOTE_WORLD_PATH:-}" ]; then
+            echo "❌ SFTP_HOST / SFTP_USER / REMOTE_WORLD_PATH are required"
+            exit 1
+          fi
+
+          WORKDIR="$GITHUB_WORKSPACE/world_backup_$(date +%s)"
+          mkdir -p "$WORKDIR"
+          echo "Downloading remote folder: $REMOTE_WORLD_PATH -> $WORKDIR"
+
+          # Use lftp mirror (one-liner) to avoid heredoc/indent problems
+          lftp -u "$SFTP_USER","$SFTP_PASS" sftp://$SFTP_HOST:${SFTP_PORT:-22} -e "set sftp:auto-confirm yes; mirror --verbose --only-newer --include-glob *.wld --include-glob *.wld.bak '$REMOTE_WORLD_PATH' '$WORKDIR'; bye" || true
+
+          echo "==== ls of downloaded folder ===="
+          ls -la "$WORKDIR" || true
+
+          echo "==== file details ===="
+          for f in "$WORKDIR"/*; do
+            [ -e "$f" ] && stat "$f" || true
+          done
+
+          COUNT=$(ls "$WORKDIR"/*.wld 2>/dev/null | wc -l || true)
+          echo "Found $COUNT .wld file(s) in $WORKDIR"
+
+          if [ "${COUNT:-0}" -eq 0 ]; then
+            echo "⚠️ No .wld files downloaded — check TERRARIA_WORLD_PATH and SFTP credentials"
+            # fail so we don't upload empty backup (optional: change to exit 0 to continue)
+            exit 1
+          fi
+
+      - name: Upload to Google Drive (archive + latest)
+        env:
+          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_REMOTE_NAME:-}" ]; then
+            echo "❌ RCLONE_REMOTE_NAME secret is required"
+            exit 1
+          fi
+
+          WORKDIR=$(ls -td "$GITHUB_WORKSPACE"/world_backup_* 2>/dev/null | head -n1 || true)
+          if [ -z "$WORKDIR" ]; then
+            echo "❌ Could not find world backup folder"
+            exit 1
+          fi
+
+          ARCHIVE="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
+          LATEST="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/latest"
+
+          echo "Uploading $WORKDIR -> $ARCHIVE"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" copy "$WORKDIR" "$ARCHIVE" --create-empty-src-dirs --transfers=4 --checkers=8 --progress
+
+          echo "Syncing to latest -> $LATEST"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" sync "$WORKDIR" "$LATEST" --create-empty-src-dirs --progress
+
+      - name: Prune old backups (optional)
+        env:
+          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+        run: |
+          set -e || true
+          KEEP_DAYS=30
+          ARCHIVE_DIR="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive"
+          echo "Pruning backups older than $KEEP_DAYS days in $ARCHIVE_DIR"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" delete "$ARCHIVE_DIR" --min-age ${KEEP_DAYS}d || true
+          echo "Prune done"          set -e
           if [ -z "${PANEL_URL:-}" ] || [ -z "${PANEL_API_KEY:-}" ] || [ -z "${SERVER_ID:-}" ]; then
             echo "Panel secrets missing"
             exit 1
