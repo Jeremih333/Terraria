@@ -34,12 +34,13 @@ jobs:
           PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
         run: |
+          set -e
           if [ -z "${PANEL_URL:-}" ] || [ -z "${PANEL_API_KEY:-}" ] || [ -z "${SERVER_ID:-}" ]; then
             echo "Panel secrets missing"
             exit 1
           fi
 
-          curl -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
+          curl -s -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
             -H "Authorization: Bearer $PANEL_API_KEY" \
             -H "Accept: application/vnd.pterodactyl.v1+json" \
             -H "Content-Type: application/json" \
@@ -55,25 +56,30 @@ jobs:
           SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
           REMOTE_WORLD_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
         run: |
+          set -e
           if [ -z "${SFTP_HOST:-}" ] || [ -z "${SFTP_USER:-}" ] || [ -z "${REMOTE_WORLD_PATH:-}" ]; then
             echo "SFTP secrets missing"
             exit 1
           fi
 
-          mkdir backup
-          
-          sshpass -p "$SFTP_PASS" lftp -u "$SFTP_USER","$SFTP_PASS" sftp://$SFTP_HOST:${SFTP_PORT:-22} <<EOT
-          set sftp:auto-confirm yes
-          mirror --include-glob *.wld --include-glob *.wld.bak $REMOTE_WORLD_PATH backup
-          bye
-EOT
+          # create local folder for this run
+          WORKDIR="$GITHUB_WORKSPACE/world_backup_$(date +%s)"
+          mkdir -p "$WORKDIR"
+          echo "Downloading from sftp://$SFTP_HOST:${SFTP_PORT:-22}${REMOTE_WORLD_PATH} -> $WORKDIR"
 
-          ls -la backup
+          # Use lftp with -e to run commands (avoids heredoc indentation issues)
+          # mirror will copy matching files from remote dir to local WORKDIR
+          lftp -u "$SFTP_USER","$SFTP_PASS" sftp://$SFTP_HOST:${SFTP_PORT:-22} -e "set sftp:auto-confirm yes; mirror --verbose --only-newer --include-glob *.wld --include-glob *.wld.bak '$REMOTE_WORLD_PATH' '$WORKDIR'; bye"
 
-          COUNT=$(ls backup/*.wld 2>/dev/null | wc -l)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No world files found"
+          echo "Files downloaded:"
+          ls -la "$WORKDIR" || true
+
+          COUNT=$(ls "$WORKDIR"/*.wld 2>/dev/null | wc -l || true)
+          if [ "${COUNT:-0}" -eq 0 ]; then
+            echo "No .wld files found in $WORKDIR — aborting"
             exit 1
+          else
+            echo "Found $COUNT .wld file(s)"
           fi
 
       - name: Upload to Google Drive
@@ -81,15 +87,36 @@ EOT
           RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
         run: |
+          set -e
+          if [ -z "${RCLONE_REMOTE_NAME:-}" ] || [ -z "${SERVER_ID:-}" ]; then
+            echo "RCLONE_REMOTE_NAME or SERVER_ID missing"
+            exit 1
+          fi
+
+          WORKDIR=$(ls -td "$GITHUB_WORKSPACE"/world_backup_* 2>/dev/null | head -n1 || true)
+          if [ -z "$WORKDIR" ]; then
+            echo "Could not find backup folder"
+            exit 1
+          fi
+
           ARCHIVE="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
           LATEST="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/latest"
 
-          rclone --config=rclone.conf copy backup "$ARCHIVE"
-          rclone --config=rclone.conf sync backup "$LATEST"
+          echo "Uploading $WORKDIR -> $ARCHIVE"
+          rclone --config=rclone.conf copy "$WORKDIR" "$ARCHIVE" --create-empty-src-dirs --transfers=4 --checkers=8
+
+          echo "Syncing to latest -> $LATEST"
+          rclone --config=rclone.conf sync "$WORKDIR" "$LATEST" --create-empty-src-dirs
 
       - name: Prune old backups
         env:
           RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
         run: |
-          rclone --config=rclone.conf delete "${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive" --min-age 30d || true
+          set -e || true
+          # keep 30 days by default
+          KEEP_DAYS=30
+          ARCHIVE_DIR="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive"
+          echo "Deleting backups older than $KEEP_DAYS days in $ARCHIVE_DIR"
+          rclone --config=rclone.conf delete "$ARCHIVE_DIR" --min-age ${KEEP_DAYS}d || true
+          echo "Prune done"
