@@ -27,7 +27,7 @@ jobs:
           fi
           echo "$RCLONE_CONF_B64" | base64 -d > "$GITHUB_WORKSPACE/rclone.conf"
           chmod 600 "$GITHUB_WORKSPACE/rclone.conf"
-          echo "✔️ rclone.conf written to $GITHUB_WORKSPACE/rclone.conf"
+          echo "✔️ rclone.conf written"
 
       - name: Trigger server save (optional; won't fail job)
         env:
@@ -42,7 +42,6 @@ jobs:
           elif [ -z "${PANEL_URL:-}" ] || [ -z "${PANEL_API_KEY:-}" ] || [ -z "${SERVER_ID:-}" ]; then
             echo "Panel secrets not fully set → skipping save"
           else
-            echo "Calling: $PANEL_URL/api/client/servers/$SERVER_ID/command"
             HTTP_CODE=$(curl -s -o panel_response.json -w "%{http_code}" \
               -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
               -H "Authorization: Bearer $PANEL_API_KEY" \
@@ -60,12 +59,13 @@ jobs:
             sleep 8
           fi
 
-      - name: Direct copy SFTP -> Google Drive via rclone
+      - name: Direct copy SFTP -> Google Drive via rclone (supports PASS or SSH KEY)
         env:
           SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
           SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
           SFTP_USER: ${{ secrets.TERRARIA_SFTP_USER }}
           SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
+          SFTP_KEY: ${{ secrets.TERRARIA_SFTP_KEY }}
           REMOTE_WORLD_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
           RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
@@ -82,24 +82,39 @@ jobs:
             exit 1
           fi
 
+          echo "SFTP auth options present? (lengths will be shown, values are not revealed)"
+          echo "SFTP_PASS length: ${#SFTP_PASS:-0}"
+          echo "SFTP_KEY length: ${#SFTP_KEY:-0}"
+
           echo "Appending temporary sftp remote (sftp_tmp) to rclone.conf"
-          # ensure newline
           printf "\n" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "[sftp_tmp]\n" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "type = sftp\n" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "host = %s\n" "$SFTP_HOST" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "user = %s\n" "$SFTP_USER" >> "$GITHUB_WORKSPACE/rclone.conf"
           printf "port = %s\n" "${SFTP_PORT:-22}" >> "$GITHUB_WORKSPACE/rclone.conf"
-          # pass can contain special chars; print as-is
-          printf "pass = %s\n" "$SFTP_PASS" >> "$GITHUB_WORKSPACE/rclone.conf"
 
-          echo "Checking remote path contents (sftp_tmp:${REMOTE_WORLD_PATH})"
+          # prefer SSH key if provided
+          if [ -n "${SFTP_KEY:-}" ]; then
+            echo "Using SSH private key auth (from secret TERRARIA_SFTP_KEY)"
+            printf "%s\n" "$SFTP_KEY" > "$GITHUB_WORKSPACE/sftp_key.pem"
+            chmod 600 "$GITHUB_WORKSPACE/sftp_key.pem"
+            printf "key_file = %s\n" "$GITHUB_WORKSPACE/sftp_key.pem" >> "$GITHUB_WORKSPACE/rclone.conf"
+          elif [ -n "${SFTP_PASS:-}" ]; then
+            echo "Using password auth (from secret TERRARIA_SFTP_PASS)"
+            # write literal password line
+            printf "pass = %s\n" "$SFTP_PASS" >> "$GITHUB_WORKSPACE/rclone.conf"
+          else
+            echo "❌ No SFTP auth provided (set TERRARIA_SFTP_PASS or TERRARIA_SFTP_KEY secret)"
+            exit 1
+          fi
+
+          echo "Listing remote path contents (rclone lsf/ls): sftp_tmp:${REMOTE_WORLD_PATH}"
           echo "---- rclone lsf (names) ----"
           rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}" --include "*.wld" --include "*.wld.bak" || true
           echo "---- rclone ls (detailed sizes) ----"
           rclone --config="$GITHUB_WORKSPACE/rclone.conf" ls "sftp_tmp:${REMOTE_WORLD_PATH}" --include "*.wld" --include "*.wld.bak" || true
 
-          # count found .wld
           COUNT=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
           echo "Found $COUNT matching files on remote"
 
