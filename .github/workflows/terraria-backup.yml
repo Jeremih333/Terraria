@@ -1,0 +1,153 @@
+name: Terraria world backup (FreeGameHost.xyz)
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+
+      # ──────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y sshpass jq lftp
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      # ──────────────────────────────
+      - name: Decode rclone config
+        env:
+          RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_CONF_B64:-}" ]; then
+            echo "❌ RCLONE_CONF secret missing"
+            exit 1
+          fi
+          # Write config into current workspace and protect permissions
+          echo "$RCLONE_CONF_B64" | base64 -d > "$GITHUB_WORKSPACE/rclone.conf"
+          chmod 600 "$GITHUB_WORKSPACE/rclone.conf"
+          echo "✔️ rclone configuration written to $GITHUB_WORKSPACE/rclone.conf"
+
+      # ──────────────────────────────
+      - name: Trigger server save
+        env:
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PANEL_URL:-}" ] || [ -z "${PANEL_API_KEY:-}" ] || [ -z "${SERVER_ID:-}" ]; then
+            echo "❌ PANEL_URL / PANEL_API_KEY / SERVER_ID must be set in repository secrets"
+            exit 1
+          fi
+
+          echo "➡️ Sending 'save' command to server..."
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
+            -H "Authorization: Bearer $PANEL_API_KEY" \
+            -H "Accept: application/vnd.pterodactyl.v1+json" \
+            -H "Content-Type: application/json" \
+            -d '{"command":"save"}' || true)
+
+          if [ -z "$HTTP_CODE" ]; then
+            echo "⚠️ No HTTP response from panel (continuing to attempt download)"
+          elif [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "200" ]; then
+            echo "✔️ Save command accepted (HTTP $HTTP_CODE)"
+          else
+            echo "⚠️ Save command returned HTTP $HTTP_CODE (continuing; server may still have saved)"
+          fi
+
+          echo "⏳ Waiting 10 seconds to ensure world flush..."
+          sleep 10
+
+      # ──────────────────────────────
+      - name: Download world files via SFTP
+        env:
+          SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
+          SFTP_USER: ${{ secrets.TERRARIA_SFTP_USER }}
+          SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
+          REMOTE_WORLD_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SFTP_HOST:-}" ] || [ -z "${SFTP_USER:-}" ] || [ -z "${REMOTE_WORLD_PATH:-}" ]; then
+            echo "❌ SFTP_HOST / SFTP_USER / REMOTE_WORLD_PATH required in secrets"
+            exit 1
+          fi
+
+          WORKDIR="$GITHUB_WORKSPACE/world_backup_$(date +%s)"
+          mkdir -p "$WORKDIR"
+          echo "➡️ Downloading world files to $WORKDIR"
+
+          if [ -n "${SFTP_PASS:-}" ]; then
+            # Use sshpass + sftp to download all .wld and .wld.bak files from target dir
+            sshpass -p "${SFTP_PASS}" sftp -oBatchMode=no -oStrictHostKeyChecking=no -P ${SFTP_PORT:-22} ${SFTP_USER}@${SFTP_HOST} <<EOF
+lcd $WORKDIR
+cd ${REMOTE_WORLD_PATH}
+mget *.wld *.wld.bak || true
+bye
+EOF
+          else
+            echo "❌ No SFTP password provided (private key not configured). Please set TERRARIA_SFTP_PASS secret or update workflow to use SSH key auth."
+            exit 1
+          fi
+
+          echo "✔️ Download finished. Listing files:"
+          ls -la "$WORKDIR" || true
+
+          # Count found .wld files
+          COUNT=$(ls "$WORKDIR"/*.wld 2>/dev/null | wc -l || true)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ No .wld world files found in $WORKDIR — aborting"
+            exit 1
+          else
+            echo "✔️ Found $COUNT .wld file(s)"
+          fi
+
+      # ──────────────────────────────
+      - name: Upload to cloud with rclone (archive + latest)
+        env:
+          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RCLONE_REMOTE_NAME:-}" ]; then
+            echo "❌ RCLONE_REMOTE_NAME secret is required"
+            exit 1
+          fi
+
+          # pick latest created backup dir
+          WORKDIR=$(ls -td "$GITHUB_WORKSPACE"/world_backup_* 2>/dev/null | head -n1 || true)
+          if [ -z "$WORKDIR" ]; then
+            echo "❌ Could not find world backup folder"
+            exit 1
+          fi
+
+          ARCHIVE_PATH="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
+          LATEST_PATH="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/latest"
+
+          echo "➡️ Uploading $WORKDIR to archive: $ARCHIVE_PATH"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" copy "$WORKDIR" "$ARCHIVE_PATH" \
+            --create-empty-src-dirs --transfers=4 --checkers=8
+
+          echo "➡️ Syncing to latest: $LATEST_PATH"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" sync "$WORKDIR" "$LATEST_PATH" --create-empty-src-dirs
+
+          echo "✔️ Upload complete"
+
+      # ──────────────────────────────
+      - name: Prune old backups (optional)
+        env:
+          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+        run: |
+          set -euo pipefail
+          KEEP_DAYS=30
+          ARCHIVE_DIR="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive"
+          echo "➡️ Deleting backups older than $KEEP_DAYS days in $ARCHIVE_DIR"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" delete "$ARCHIVE_DIR" --min-age ${KEEP_DAYS}d || true
+          echo "✔️ Prune done"
