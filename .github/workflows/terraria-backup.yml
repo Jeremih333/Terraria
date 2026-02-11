@@ -110,18 +110,28 @@ jobs:
             printf "key_file = %s\n" "$GITHUB_WORKSPACE/sftp_key.pem" >> "$GITHUB_WORKSPACE/rclone.conf"
           elif [ -n "${SFTP_PASS:-}" ]; then
             echo "Using password auth (from secret TERRARIA_SFTP_PASS)"
-            # write literal password line
             printf "pass = %s\n" "$SFTP_PASS" >> "$GITHUB_WORKSPACE/rclone.conf"
           else
             echo "❌ No SFTP auth provided (set TERRARIA_SFTP_PASS or TERRARIA_SFTP_KEY secret)"
             exit 1
           fi
 
-          echo "Listing remote path contents (rclone lsf/ls): sftp_tmp:${REMOTE_WORLD_PATH}"
-          echo "---- rclone lsf (names) ----"
+          echo "DEBUG: listing root of sftp_tmp:"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:" || true
+
+          echo "DEBUG: listing parent of REMOTE_WORLD_PATH"
+          PARENT_DIR="$(dirname "${REMOTE_WORLD_PATH}")"
+          echo "PARENT_DIR = $PARENT_DIR"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${PARENT_DIR}" || true
+
+          echo "DEBUG: listing REMOTE_WORLD_PATH (no filters)"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}" || true
+
+          echo "DEBUG: detailed list (lsjson, recursive)"
+          rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsjson "sftp_tmp:${REMOTE_WORLD_PATH}" --recursive --files-only || true
+
+          echo "DEBUG: try listing with wildcard include (just names)"
           rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}" --include "*.wld" --include "*.wld.bak" || true
-          echo "---- rclone ls (detailed sizes) ----"
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" ls "sftp_tmp:${REMOTE_WORLD_PATH}" --include "*.wld" --include "*.wld.bak" || true
 
           COUNT=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:${REMOTE_WORLD_PATH}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
           echo "Found $COUNT matching files on remote"
