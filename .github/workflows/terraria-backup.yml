@@ -1,9 +1,9 @@
 name: Terraria world backup (FreeGameHost.xyz)
 
 on:
+  workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *'
-  workflow_dispatch: {}
+    - cron: "*/15 * * * *"
 
 jobs:
   backup:
@@ -14,216 +14,76 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y sshpass jq
+          sudo apt-get install -y jq
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Decode rclone config
         env:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
         run: |
-          set -euo pipefail
-          if [ -z "${RCLONE_CONF_B64:-}" ]; then
-            echo "❌ RCLONE_CONF secret missing"
+          set -e
+          if [ -z "${RCLONE_CONF_B64}" ]; then
+            echo "RCLONE_CONF secret missing"
             exit 1
           fi
-          echo "$RCLONE_CONF_B64" | base64 -d > "$GITHUB_WORKSPACE/rclone.conf"
-          chmod 600 "$GITHUB_WORKSPACE/rclone.conf"
-          echo "✔️ rclone.conf ready"
+          echo "$RCLONE_CONF_B64" | base64 -d > rclone.conf
+          chmod 600 rclone.conf
+          echo "rclone.conf ready"
 
-      - name: (Optional) Trigger server save
+      - name: Create temporary SFTP remote
         env:
-          PANEL_URL: ${{ secrets.PANEL_URL }}
-          PANEL_API_KEY: ${{ secrets.PANEL_API_KEY }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-          SKIP_SAVE: ${{ secrets.SKIP_SAVE }}
+          SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
+          SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
+          SFTP_USER: ${{ secrets.TERRARIA_SFTP_USER }}
+          SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
         run: |
-          set -euo pipefail || true
-          if [ "${SKIP_SAVE:-}" = "true" ]; then
-            echo "SKIP_SAVE=true → skipping panel save"
-          elif [ -n "${PANEL_URL:-}" ] && [ -n "${PANEL_API_KEY:-}" ] && [ -n "${SERVER_ID:-}" ]; then
-            echo "Issuing save command to panel (best-effort)..."
-            HTTP_CODE=$(curl -s -o panel_response.json -w "%{http_code}" \
-              -X POST "$PANEL_URL/api/client/servers/$SERVER_ID/command" \
-              -H "Authorization: Bearer $PANEL_API_KEY" \
-              -H "Accept: application/vnd.pterodactyl.v1+json" \
-              -H "Content-Type: application/json" \
-              -d '{"command":"save"}' || true)
-            echo "Panel HTTP code: $HTTP_CODE"
-            cat panel_response.json || true
-            sleep 8
-          else
-            echo "Panel API not configured → skipping save"
+          set -e
+
+          if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USER" ] || [ -z "$SFTP_PASS" ]; then
+            echo "SFTP secrets missing"
+            exit 1
           fi
 
-      - name: SFTP copy: detect path & upload to Google Drive
-        id: sftp_upload
+          rclone --config=rclone.conf config delete sftp_tmp || true
+
+          rclone --config=rclone.conf config create sftp_tmp sftp \
+            host "$SFTP_HOST" \
+            user "$SFTP_USER" \
+            port "${SFTP_PORT:-22}" \
+            pass "$SFTP_PASS"
+
+          echo "SFTP remote created"
+
+      - name: Copy world files to Google Drive
         env:
-          TERRARIA_SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
-          TERRARIA_SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
-          TERRARIA_SFTP_USER: ${{ secrets.TERRARIA_SFTP_USER }}
-          TERRARIA_SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
-          TERRARIA_SFTP_KEY: ${{ secrets.TERRARIA_SFTP_KEY }}
-          TERRARIA_WORLD_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
-          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
+          REMOTE_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
+          DRIVE_REMOTE: ${{ secrets.RCLONE_REMOTE_NAME }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
         run: |
-          set -euo pipefail
+          set -e
 
-          SFTP_HOST="${TERRARIA_SFTP_HOST:-}"
-          SFTP_PORT="${TERRARIA_SFTP_PORT:-22}"
-          SFTP_USER="${TERRARIA_SFTP_USER:-}"
-          SFTP_PASS="${TERRARIA_SFTP_PASS:-}"
-          SFTP_KEY="${TERRARIA_SFTP_KEY:-}"
-          REMOTE_WORLD_PATH="${TERRARIA_WORLD_PATH:-}"
-          RCLONE_REMOTE="${RCLONE_REMOTE_NAME:-}"
-          SERVER_ID="${SERVER_ID:-}"
-
-          if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USER" ]; then
-            echo "❌ SFTP_HOST and SFTP_USER must be set in secrets"
-            exit 1
-          fi
-          if [ -z "$RCLONE_REMOTE" ] || [ -z "$SERVER_ID" ]; then
-            echo "❌ RCLONE_REMOTE_NAME and SERVER_ID must be set in secrets"
+          if [ -z "$REMOTE_PATH" ] || [ -z "$DRIVE_REMOTE" ] || [ -z "$SERVER_ID" ]; then
+            echo "Required secrets missing"
             exit 1
           fi
 
-          echo "Auth options: (lengths only)"
-          if [ -n "$SFTP_PASS" ]; then
-            echo "SFTP_PASS length: ${#SFTP_PASS}"
-          else
-            echo "SFTP_PASS not set"
-          fi
-          if [ -n "$SFTP_KEY" ]; then
-            echo "SFTP_KEY present"
-          else
-            echo "SFTP_KEY not set"
-          fi
+          ARCHIVE_PATH="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
+          LATEST_PATH="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
 
-          # create temporary key file if key provided
-          TMP_KEY=""
-          if [ -n "$SFTP_KEY" ] && [ -z "$SFTP_PASS" ]; then
-            TMP_KEY="$GITHUB_WORKSPACE/terraria_sftp_key.pem"
-            printf "%s\n" "$SFTP_KEY" > "$TMP_KEY"
-            chmod 600 "$TMP_KEY"
-          fi
+          echo "Copying archive..."
+          rclone --config=rclone.conf copy "sftp_tmp:${REMOTE_PATH}" "$ARCHIVE_PATH" \
+            --include "*.wld" \
+            --include "*.wld.bak" \
+            --create-empty-src-dirs
 
-          # ensure no leftover remote named sftp_tmp
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" config delete sftp_tmp >/dev/null 2>&1 || true
+          echo "Syncing latest..."
+          rclone --config=rclone.conf sync "sftp_tmp:${REMOTE_PATH}" "$LATEST_PATH" \
+            --include "*.wld" \
+            --include "*.wld.bak"
 
-          # create sftp_tmp remote using rclone config create
-          if [ -n "$TMP_KEY" ]; then
-            echo "Creating rclone remote sftp_tmp using key file"
-            rclone --config="$GITHUB_WORKSPACE/rclone.conf" config create sftp_tmp sftp \
-              host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" key_file "$TMP_KEY"
-          elif [ -n "$SFTP_PASS" ]; then
-            echo "Creating rclone remote sftp_tmp using password"
-            rclone --config="$GITHUB_WORKSPACE/rclone.conf" config create sftp_tmp sftp \
-              host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" pass "$SFTP_PASS"
-          else
-            echo "❌ No SFTP auth available – set TERRARIA_SFTP_PASS or TERRARIA_SFTP_KEY"
-            exit 1
-          fi
+          echo "Backup complete"
 
-          # quick connection test
-          echo "Testing sftp_tmp connectivity..."
-          if ! rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "sftp_tmp:" >/dev/null 2>&1; then
-            echo "ERROR: cannot list sftp_tmp:. Connection/auth likely invalid"
-            rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsd "sftp_tmp:" || true
-            rclone --config="$GITHUB_WORKSPACE/rclone.conf" config delete sftp_tmp >/dev/null 2>&1 || true
-            exit 1
-          fi
-          echo "✔️ sftp_tmp reachable"
-
-          # candidate paths to try
-          CANDIDATES=(
-            "${REMOTE_WORLD_PATH}"
-            "saves/Worlds"
-            "saves"
-            "Worlds"
-            "world"
-            "/home/container/saves/Worlds"
-            "/home/container/saves"
-            "/home/container"
-            "/home/${SFTP_USER}"
-            "/home"
-            ""
-          )
-
-          FOUND=""
-          for p in "${CANDIDATES[@]}"; do
-            if [ -z "$p" ]; then
-              TARGET="sftp_tmp:"
-              SHOW="(root)"
-            else
-              TARGET="sftp_tmp:${p}"
-              SHOW="$p"
-            fi
-            echo "Trying: $SHOW"
-            MATCHES=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "$TARGET" --include "*.wld" --include "*.wld.bak" 2>/dev/null || true)
-            if [ -n "$MATCHES" ]; then
-              FOUND="$p"
-              echo " → matches found in $SHOW"
-              break
-            else
-              echo " → none"
-            fi
-          done
-
-          # recursive fallback
-          if [ -z "$FOUND" ]; then
-            echo "No candidates matched; performing controlled recursive search..."
-            FIRST_PATH=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsjson "sftp_tmp:" --recursive --files-only 2>/dev/null \
-              | jq -r '.[] | select(.Path | test("\\.wld$")) | .Path' | head -n1 || true)
-            if [ -n "$FIRST_PATH" ]; then
-              FOUND="$(dirname "$FIRST_PATH")"
-              echo "Found .wld at $FIRST_PATH; using parent $FOUND"
-            else
-              echo "❌ No .wld files found on server via sftp_tmp:"
-              rclone --config="$GITHUB_WORKSPACE/rclone.conf" config delete sftp_tmp >/dev/null 2>&1 || true
-              exit 1
-            fi
-          fi
-
-          if [ -z "$FOUND" ]; then
-            SELECTED_TARGET="sftp_tmp:"
-            SELECTED_PATH="(root)"
-          else
-            SELECTED_TARGET="sftp_tmp:${FOUND}"
-            SELECTED_PATH="$FOUND"
-          fi
-
-          echo "Selected remote path: $SELECTED_PATH"
-
-          FINAL_COUNT=$(rclone --config="$GITHUB_WORKSPACE/rclone.conf" lsf "$SELECTED_TARGET" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
-          echo "Files to back up: $FINAL_COUNT"
-          if [ "${FINAL_COUNT:-0}" -eq 0 ]; then
-            echo "No files to copy; exiting"
-            rclone --config="$GITHUB_WORKSPACE/rclone.conf" config delete sftp_tmp >/dev/null 2>&1 || true
-            exit 1
-          fi
-
-          ARCHIVE="${RCLONE_REMOTE}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
-          LATEST="${RCLONE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
-
-          echo "Copying to archive: $ARCHIVE"
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" copy "$SELECTED_TARGET" "$ARCHIVE" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs --transfers=4 --checkers=8 --progress
-
-          echo "Syncing latest -> $LATEST"
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" sync "$SELECTED_TARGET" "$LATEST" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs --progress
-
-          # cleanup
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" config delete sftp_tmp >/dev/null 2>&1 || true
-          echo "✔️ Upload complete"
-
-      - name: Prune old backups (optional)
-        env:
-          RCLONE_REMOTE_NAME: ${{ secrets.RCLONE_REMOTE_NAME }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
+      - name: Cleanup
         run: |
-          set -e || true
-          KEEP_DAYS=30
-          ARCHIVE_DIR="${RCLONE_REMOTE_NAME}:terraria-backups/${SERVER_ID}/archive"
-          rclone --config="$GITHUB_WORKSPACE/rclone.conf" delete "$ARCHIVE_DIR" --min-age ${KEEP_DAYS}d || true
-          echo "✔️ Prune done"
+          rclone --config=rclone.conf config delete sftp_tmp || true
+          echo "Cleanup done"
