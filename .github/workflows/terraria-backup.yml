@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl sed coreutils
+          sudo apt-get install -y jq curl coreutils
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Decode rclone config
@@ -47,7 +47,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # defaults
           SFTP_PORT="${SFTP_PORT:-2022}"
           KEEP_DAYS="${KEEP_DAYS:-30}"
 
@@ -56,15 +55,11 @@ jobs:
             exit 1
           fi
 
-          # Remove previous remote
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
-
-          # Create temporary remote
           rclone --config=rclone.conf config create sftp_tmp sftp \
             host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" pass "$SFTP_PASS"
 
-          # Connection test
-          echo "Testing sftp_tmp..."
+          echo "Testing sftp_tmp connectivity..."
           if ! rclone --config=rclone.conf lsf "sftp_tmp:" >/dev/null 2>&1; then
             echo "Connection failed"
             rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
@@ -72,7 +67,6 @@ jobs:
           fi
           echo "✔️ sftp_tmp reachable"
 
-          # Candidate paths
           CANDIDATES=(
             "${REMOTE_PATH}"
             "saves/Worlds"
@@ -117,16 +111,21 @@ jobs:
           echo "files=${FINAL_COUNT}" >> "$GITHUB_OUTPUT"
           echo "path=${SELECTED_PATH}" >> "$GITHUB_OUTPUT"
 
-          # Destinations
           ARCHIVE="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
           LATEST="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
           RCLONE_FLAGS="--retries 5 --low-level-retries 10 --timeout 1m --transfers 1 --checkers 8 --progress -v"
 
-          rclone --config=rclone.conf copy "$SELECTED_TARGET" "$ARCHIVE" --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
-          rclone --config=rclone.conf sync "$SELECTED_TARGET" "$LATEST" --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
+          echo "Copying to archive..."
+          rclone --config=rclone.conf copy "$SELECTED_TARGET" "$ARCHIVE" \
+            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
 
-          # Prune old backups
+          echo "Syncing latest..."
+          rclone --config=rclone.conf sync "$SELECTED_TARGET" "$LATEST" \
+            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
+
+          echo "Pruning old backups..."
           rclone --config=rclone.conf delete "${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive" --min-age ${KEEP_DAYS}d || true
+
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1
           echo "✔️ Upload complete"
 
@@ -138,7 +137,7 @@ jobs:
       - name: Install utils
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl jq sed coreutils
+          sudo apt-get install -y curl jq coreutils
 
       - name: Prepare notification variables
         run: |
@@ -147,7 +146,7 @@ jobs:
           echo "selected_path=${{ needs.backup.outputs.path }}" >> $GITHUB_ENV
           echo "server_id=${{ secrets.SERVER_ID }}" >> $GITHUB_ENV
 
-      - name: Send Telegram notification
+      - name: Send Telegram notification (optional)
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -156,13 +155,19 @@ jobs:
             STATUS="${backup_result}"
             FILES="${files_backed:-0}"
             PATH="${selected_path:-unknown}"
-            MSG="Terraria backup (${server_id}) — status: ${STATUS}\nfiles: ${FILES}\npath: ${PATH}\nRepo: ${{ github.repository }}\nRun: ${{ github.run_number }}"
-            TEXT=$(printf "%s" "$MSG" | sed 's/ /%20/g;s/#/%23/g;s/\\n/%0A/g')
-            curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage?chat_id=${TG_CHAT}&text=${TEXT}" >/dev/null || true
+            JSON=$(jq -n \
+              --arg chat_id "$TG_CHAT" \
+              --arg text "Terraria backup (${server_id}) — status: ${STATUS}\nfiles: ${FILES}\npath: ${PATH}\nRepo: ${{ github.repository }}\nRun: ${{ github.run_number }}" \
+              '{chat_id: $chat_id, text: $text}')
+            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$JSON" >/dev/null || true
             echo "Telegram notified"
+          else
+            echo "Telegram secrets not set — skipping"
           fi
 
-      - name: Send Discord notification
+      - name: Send Discord notification (optional)
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
@@ -170,7 +175,11 @@ jobs:
             STATUS="${backup_result}"
             FILES="${files_backed:-0}"
             PATH="${selected_path:-unknown}"
-            JSON="{\"embeds\":[{\"title\":\"Terraria backup: ${server_id}\",\"description\":\"status: ${STATUS}\\nfiles: ${FILES}\\npath: ${PATH}\",\"color\":65280}]}"
+            JSON=$(jq -n \
+              --arg desc "status: ${STATUS}\nfiles: ${FILES}\npath: ${PATH}" \
+              '{"embeds":[{"title":"Terraria backup: '${server_id}'","description":$desc,"color":65280}]}')
             curl -s -H "Content-Type: application/json" -d "$JSON" "${DISCORD_WEBHOOK}" >/dev/null || true
             echo "Discord notified"
+          else
+            echo "Discord webhook not set — skipping"
           fi
