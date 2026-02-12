@@ -55,10 +55,10 @@ jobs:
             exit 1
           fi
 
-          # ensure no leftover temporary remote
+          # cleanup any previous temp remote
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
 
-          # create temporary sftp remote (password auth)
+          # create temp sftp remote (password auth)
           if [ -n "${SFTP_PASS:-}" ]; then
             rclone --config=rclone.conf config create sftp_tmp sftp \
               host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" pass "$SFTP_PASS"
@@ -95,21 +95,23 @@ jobs:
           for p in "${CANDIDATES[@]}"; do
             if [ -z "$p" ]; then
               TARGET="sftp_tmp:"
+              SHOW="(root)"
             else
               TARGET="sftp_tmp:${p}"
+              SHOW="$p"
             fi
-            echo "Trying: ${p:-'(root)'}"
+            echo "Trying: $SHOW"
             MATCHES=$(rclone --config=rclone.conf lsf "$TARGET" --include "*.wld" --include "*.wld.bak" 2>/dev/null || true)
             if [ -n "$MATCHES" ]; then
               FOUND="$p"
-              echo " → matches found in ${p:-'(root)'}"
+              echo " → matches found in $SHOW"
               break
             else
               echo " → none"
             fi
           done
 
-          # recursive fallback
+          # recursive fallback if nothing found
           if [ -z "$FOUND" ]; then
             FIRST=$(rclone --config=rclone.conf lsjson "sftp_tmp:" --recursive --files-only 2>/dev/null \
               | jq -r '.[] | select(.Path | test("\\.wld$")) | .Path' | head -n1 || true)
@@ -155,10 +157,10 @@ jobs:
           echo "Pruning backups older than ${KEEP_DAYS} days..."
           rclone --config=rclone.conf delete "${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive" --min-age ${KEEP_DAYS}d || true
 
-          # cleanup temporary remote
+          # cleanup temp remote
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
 
-          # outputs for notify
+          # publish outputs for notify job
           echo "files=${FINAL_COUNT}" >> "$GITHUB_OUTPUT"
           echo "path=${SELECTED_PATH}" >> "$GITHUB_OUTPUT"
 
@@ -172,7 +174,7 @@ jobs:
       - name: Install minimal utils
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl python3
+          sudo apt-get install -y curl coreutils
 
       - name: Prepare notification variables
         run: |
@@ -190,18 +192,10 @@ jobs:
             STATUS="${backup_result}"
             FILES="${files_backed:-0}"
             PATH="${selected_path:-unknown}"
-            # build payload.json safely with python3 (avoids jq/sed issues)
-            export TG_CHAT STATUS FILES PATH server_id
-            python3 - <<PY > /tmp/tg_payload.json
-import os, json
-payload = {
-  "chat_id": os.environ["TG_CHAT"],
-  "text": f"Terraria backup ({os.environ.get('server_id')}) — status: {os.environ.get('STATUS')}\\nfiles: {os.environ.get('FILES')}\\npath: {os.environ.get('PATH')}\\nRepo: {os.environ.get('GITHUB_REPOSITORY')}\\nRun: {os.environ.get('GITHUB_RUN_NUMBER')}"
-}
-print(json.dumps(payload))
-PY
+            MSG="Terraria backup (${server_id}) — status: ${STATUS}\nfiles: ${FILES}\npath: ${PATH}\nRepo: ${{ github.repository }}\nRun: ${{ github.run_number }}"
+            # --data-urlencode safely encodes spaces/newlines
             curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-              -H "Content-Type: application/json" --data @/tmp/tg_payload.json >/dev/null || true
+              -d chat_id="${TG_CHAT}" --data-urlencode "text=${MSG}" >/dev/null || true
             echo "Telegram notified"
           else
             echo "Telegram secrets not set — skipping"
@@ -215,14 +209,9 @@ PY
             STATUS="${backup_result}"
             FILES="${files_backed:-0}"
             PATH="${selected_path:-unknown}"
-            export STATUS FILES PATH server_id
-            python3 - <<PY > /tmp/discord_payload.json
-import os, json
-desc = f"status: {os.environ.get('STATUS')}\\nfiles: {os.environ.get('FILES')}\\npath: {os.environ.get('PATH')}"
-payload = {"embeds":[{"title":f"Terraria backup: {os.environ.get('server_id')}", "description": desc, "color":65280}]}
-print(json.dumps(payload))
-PY
-            curl -s -H "Content-Type: application/json" -d @/tmp/discord_payload.json "${DISCORD_WEBHOOK}" >/dev/null || true
+            JSON=$(printf '{"embeds":[{"title":"Terraria backup: %s","description":"status: %s\nfiles: %s\npath: %s","color":65280}]}' \
+              "${server_id}" "${STATUS}" "${FILES}" "${PATH}")
+            curl -s -H "Content-Type: application/json" -d "$JSON" "${DISCORD_WEBHOOK}" >/dev/null || true
             echo "Discord notified"
           else
             echo "Discord webhook not set — skipping"
