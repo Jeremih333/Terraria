@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 40
     outputs:
       files: ${{ steps.run_backup.outputs.files }}
-      path: ${{ steps.run_backup.outputs.path }}
+      path:  ${{ steps.run_backup.outputs.path }}
 
     steps:
       - name: Install dependencies
@@ -36,14 +36,14 @@ jobs:
       - name: Run backup (detect path, upload)
         id: run_backup
         env:
-          SFTP_HOST: ${{ secrets.TERRARIA_SFTP_HOST }}
-          SFTP_PORT: ${{ secrets.TERRARIA_SFTP_PORT }}
-          SFTP_USER: ${{ secrets.TERRARIA_SFTP_USER }}
-          SFTP_PASS: ${{ secrets.TERRARIA_SFTP_PASS }}
-          REMOTE_PATH: ${{ secrets.TERRARIA_WORLD_PATH }}
+          SFTP_HOST:    ${{ secrets.TERRARIA_SFTP_HOST }}
+          SFTP_PORT:    ${{ secrets.TERRARIA_SFTP_PORT }}
+          SFTP_USER:    ${{ secrets.TERRARIA_SFTP_USER }}
+          SFTP_PASS:    ${{ secrets.TERRARIA_SFTP_PASS }}
+          REMOTE_PATH:  ${{ secrets.TERRARIA_WORLD_PATH }}
           DRIVE_REMOTE: ${{ secrets.RCLONE_REMOTE_NAME }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-          KEEP_DAYS: ${{ secrets.KEEP_DAYS }}
+          SERVER_ID:    ${{ secrets.SERVER_ID }}
+          KEEP_DAYS:    ${{ secrets.KEEP_DAYS }}
         run: |
           set -euo pipefail
 
@@ -55,10 +55,10 @@ jobs:
             exit 1
           fi
 
-          # cleanup any previous temp remote
+          # Ensure no stale remote
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
 
-          # create temp sftp remote (password auth preferred)
+          # Create temporary sftp remote (using password)
           if [ -n "${SFTP_PASS:-}" ]; then
             rclone --config=rclone.conf config create sftp_tmp sftp \
               host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" pass "$SFTP_PASS"
@@ -67,16 +67,17 @@ jobs:
             exit 1
           fi
 
-          # test connectivity
+          # Connection test
           echo "Testing sftp_tmp connectivity..."
           if ! rclone --config=rclone.conf lsf "sftp_tmp:" >/dev/null 2>&1; then
-            echo "Connection failed"
+            echo "ERROR: cannot list sftp_tmp: — connection/auth likely invalid"
+            rclone --config=rclone.conf lsd "sftp_tmp:" || true
             rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
             exit 1
           fi
           echo "✔️ sftp_tmp reachable"
 
-          # candidate paths (REMOTE_PATH preferred)
+          # Candidate paths (REMOTE_PATH preferred)
           CANDIDATES=(
             "${REMOTE_PATH}"
             "saves/Worlds"
@@ -111,8 +112,9 @@ jobs:
             fi
           done
 
-          # recursive fallback if nothing found
+          # Recursive fallback if nothing matched
           if [ -z "${FOUND}" ]; then
+            echo "No candidate matched — searching recursively (controlled)"
             FIRST=$(rclone --config=rclone.conf lsjson "sftp_tmp:" --recursive --files-only 2>/dev/null \
               | jq -r '.[] | select(.Path | test("\\.wld$")) | .Path' | head -n1 || true)
             if [ -n "${FIRST}" ]; then
@@ -127,6 +129,7 @@ jobs:
             fi
           fi
 
+          # Finalize selected path & count files
           SELECTED_TARGET="sftp_tmp:${FOUND}"
           SELECTED_PATH="${FOUND}"
           FINAL_COUNT=$(rclone --config=rclone.conf lsf "${SELECTED_TARGET}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
@@ -141,7 +144,7 @@ jobs:
             exit 1
           fi
 
-          # destinations
+          # Destinations & flags
           ARCHIVE="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
           LATEST="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
           RCLONE_FLAGS="--retries 5 --low-level-retries 10 --timeout 1m --transfers 1 --checkers 8 --progress -v"
@@ -157,13 +160,10 @@ jobs:
           echo "Pruning backups older than ${KEEP_DAYS} days..."
           rclone --config=rclone.conf delete "${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive" --min-age ${KEEP_DAYS}d || true
 
-          # cleanup temp remote
+          # Cleanup and outputs
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
-
-          # publish outputs for notify job
           echo "files=${FINAL_COUNT}" >> "$GITHUB_OUTPUT"
           echo "path=${SELECTED_PATH}" >> "$GITHUB_OUTPUT"
-
           echo "✔️ Upload complete"
 
   notify:
@@ -178,7 +178,6 @@ jobs:
 
       - name: Prepare notification variables
         run: |
-          # pass values to environment for the python step
           echo "backup_result=${{ needs.backup.result }}" >> $GITHUB_ENV
           echo "files_backed=${{ needs.backup.outputs.files }}" >> $GITHUB_ENV
           echo "selected_path=${{ needs.backup.outputs.path }}" >> $GITHUB_ENV
@@ -186,26 +185,26 @@ jobs:
           echo "repo_name=${{ github.repository }}" >> $GITHUB_ENV
           echo "run_number=${{ github.run_number }}" >> $GITHUB_ENV
 
-      - name: Send notifications (Telegram + Discord) using Python (reliable, retries, resolve @username)
+      - name: Send notifications (Telegram + Discord) using Python
         env:
-          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TG_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:       ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK:${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python3 - <<'PY'
 import os, time, json, sys
 from urllib import request, parse
 
 TG_TOKEN = os.environ.get("TG_TOKEN")
-TG_CHAT = os.environ.get("TG_CHAT")  # numeric or @username
+TG_CHAT  = os.environ.get("TG_CHAT")
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 
 backup_result = os.environ.get("backup_result","unknown")
-files_backed = os.environ.get("files_backed","0")
-selected_path = os.environ.get("selected_path","(unknown)")
-server_id = os.environ.get("server_id","(unknown)")
-repo_name = os.environ.get("repo_name","")
-run_number = os.environ.get("run_number","")
+files_backed   = os.environ.get("files_backed","0")
+selected_path  = os.environ.get("selected_path","(unknown)")
+server_id      = os.environ.get("server_id","(unknown)")
+repo_name      = os.environ.get("repo_name","")
+run_number     = os.environ.get("run_number","")
 
 def http_post(url, data=None, headers=None, timeout=15):
     req = request.Request(url, data=data, headers=headers or {})
@@ -224,10 +223,8 @@ def retry_call(func, tries=4, delay=1, backoff=2):
 def resolve_chat_id(token, chat):
     if not chat:
         return None
-    # numeric id?
     if chat.strip().lstrip("-").isdigit():
         return chat
-    # ensure @ prefix
     q = chat if chat.startswith("@") else "@" + chat
     url = f"https://api.telegram.org/bot{token}/getChat"
     data = parse.urlencode({"chat_id": q}).encode()
