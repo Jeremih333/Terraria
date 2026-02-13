@@ -25,7 +25,7 @@ jobs:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
         run: |
           set -e
-          if [ -z "${RCLONE_CONF_B64}" ]; then
+          if [ -z "${RCLONE_CONF_B64:-}" ]; then
             echo "RCLONE_CONF secret missing"
             exit 1
           fi
@@ -50,7 +50,7 @@ jobs:
           SFTP_PORT="${SFTP_PORT:-2022}"
           KEEP_DAYS="${KEEP_DAYS:-30}"
 
-          if [ -z "$SFTP_HOST" ] || [ -z "$SFTP_USER" ] || [ -z "$DRIVE_REMOTE" ] || [ -z "$SERVER_ID" ]; then
+          if [ -z "${SFTP_HOST:-}" ] || [ -z "${SFTP_USER:-}" ] || [ -z "${DRIVE_REMOTE:-}" ] || [ -z "${SERVER_ID:-}" ]; then
             echo "Missing required secrets (SFTP_HOST/SFTP_USER/DRIVE_REMOTE/SERVER_ID)"
             exit 1
           fi
@@ -93,18 +93,18 @@ jobs:
 
           FOUND=""
           for p in "${CANDIDATES[@]}"; do
-            if [ -z "$p" ]; then
+            if [ -z "${p}" ]; then
               TARGET="sftp_tmp:"
               SHOW="(root)"
             else
               TARGET="sftp_tmp:${p}"
-              SHOW="$p"
+              SHOW="${p}"
             fi
-            echo "Trying: $SHOW"
-            MATCHES=$(rclone --config=rclone.conf lsf "$TARGET" --include "*.wld" --include "*.wld.bak" 2>/dev/null || true)
-            if [ -n "$MATCHES" ]; then
-              FOUND="$p"
-              echo " → matches found in $SHOW"
+            echo "Trying: ${SHOW}"
+            MATCHES=$(rclone --config=rclone.conf lsf "${TARGET}" --include "*.wld" --include "*.wld.bak" 2>/dev/null || true)
+            if [ -n "${MATCHES}" ]; then
+              FOUND="${p}"
+              echo " → matches found in ${SHOW}"
               break
             else
               echo " → none"
@@ -112,12 +112,12 @@ jobs:
           done
 
           # recursive fallback if nothing found
-          if [ -z "$FOUND" ]; then
+          if [ -z "${FOUND}" ]; then
             FIRST=$(rclone --config=rclone.conf lsjson "sftp_tmp:" --recursive --files-only 2>/dev/null \
               | jq -r '.[] | select(.Path | test("\\.wld$")) | .Path' | head -n1 || true)
-            if [ -n "$FIRST" ]; then
-              FOUND="$(dirname "$FIRST")"
-              echo "Found .wld at $FIRST; using parent $FOUND"
+            if [ -n "${FIRST}" ]; then
+              FOUND="$(dirname "${FIRST}")"
+              echo "Found .wld at ${FIRST}; using parent ${FOUND}"
             else
               echo "❌ No .wld files found on sftp_tmp:"
               rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
@@ -129,7 +129,7 @@ jobs:
 
           SELECTED_TARGET="sftp_tmp:${FOUND}"
           SELECTED_PATH="${FOUND}"
-          FINAL_COUNT=$(rclone --config=rclone.conf lsf "$SELECTED_TARGET" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
+          FINAL_COUNT=$(rclone --config=rclone.conf lsf "${SELECTED_TARGET}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
           FINAL_COUNT="${FINAL_COUNT:-0}"
           echo "Files to back up: ${FINAL_COUNT}"
 
@@ -146,13 +146,13 @@ jobs:
           LATEST="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
           RCLONE_FLAGS="--retries 5 --low-level-retries 10 --timeout 1m --transfers 1 --checkers 8 --progress -v"
 
-          echo "Copying to archive: $ARCHIVE"
-          rclone --config=rclone.conf copy "$SELECTED_TARGET" "$ARCHIVE" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
+          echo "Copying to archive: ${ARCHIVE}"
+          rclone --config=rclone.conf copy "${SELECTED_TARGET}" "${ARCHIVE}" \
+            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs ${RCLONE_FLAGS}
 
-          echo "Syncing latest -> $LATEST"
-          rclone --config=rclone.conf sync "$SELECTED_TARGET" "$LATEST" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
+          echo "Syncing latest -> ${LATEST}"
+          rclone --config=rclone.conf sync "${SELECTED_TARGET}" "${LATEST}" \
+            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs ${RCLONE_FLAGS}
 
           echo "Pruning backups older than ${KEEP_DAYS} days..."
           rclone --config=rclone.conf delete "${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive" --min-age ${KEEP_DAYS}d || true
@@ -194,11 +194,10 @@ jobs:
         run: |
           python3 - <<'PY'
 import os, time, json, sys
-from urllib import request, parse, error
+from urllib import request, parse
 
-# envs
 TG_TOKEN = os.environ.get("TG_TOKEN")
-TG_CHAT = os.environ.get("TG_CHAT")  # can be numeric or @username
+TG_CHAT = os.environ.get("TG_CHAT")  # numeric or @username
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 
 backup_result = os.environ.get("backup_result","unknown")
@@ -210,39 +209,35 @@ run_number = os.environ.get("run_number","")
 
 def http_post(url, data=None, headers=None, timeout=15):
     req = request.Request(url, data=data, headers=headers or {})
-    return request.urlopen(req, timeout=timeout).read(), req
+    return request.urlopen(req, timeout=timeout).read()
 
-def retry(f, tries=5, delay=1, backoff=2):
-    last_exc = None
+def retry_call(func, tries=4, delay=1, backoff=2):
+    last = None
     for i in range(tries):
         try:
-            return f()
+            return func()
         except Exception as e:
-            last_exc = e
-            t = delay * (backoff ** i)
-            time.sleep(t)
-    raise last_exc
+            last = e
+            time.sleep(delay * (backoff ** i))
+    raise last
 
 def resolve_chat_id(token, chat):
-    # if numeric, return as-is
     if not chat:
         return None
+    # numeric id?
     if chat.strip().lstrip("-").isdigit():
         return chat
-    # if username like @username or username, call getChat
-    if chat.startswith("@"):
-        q = chat
-    else:
-        q = "@"+chat
+    # ensure @ prefix
+    q = chat if chat.startswith("@") else "@" + chat
     url = f"https://api.telegram.org/bot{token}/getChat"
     data = parse.urlencode({"chat_id": q}).encode()
     def call():
-        resp, _ = http_post(url, data=data)
+        resp = http_post(url, data=data)
         j = json.loads(resp.decode())
         if not j.get("ok"):
             raise Exception("getChat failed: " + str(j))
         return str(j["result"]["id"])
-    return retry(call, tries=4, delay=1)
+    return retry_call(call, tries=4)
 
 def send_telegram(token, chat_id, text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -250,48 +245,44 @@ def send_telegram(token, chat_id, text):
     data = json.dumps(payload).encode()
     headers = {"Content-Type":"application/json"}
     def call():
-        resp, _ = http_post(url, data=data, headers=headers)
+        resp = http_post(url, data=data, headers=headers)
         j = json.loads(resp.decode())
         if not j.get("ok"):
             raise Exception("sendMessage failed: " + str(j))
         return j
-    return retry(call, tries=5, delay=1)
+    return retry_call(call, tries=5)
 
 def send_discord(webhook, description):
     payload = {"embeds":[{"title":f"Terraria backup: {server_id}", "description": description, "color":65280}]}
     data = json.dumps(payload).encode()
     headers = {"Content-Type":"application/json"}
     def call():
-        resp, _ = http_post(webhook, data=data, headers=headers)
+        resp = http_post(webhook, data=data, headers=headers)
         return resp
-    return retry(call, tries=4, delay=1)
+    return retry_call(call, tries=4)
 
-# Build message
 status = backup_result.upper()
 msg = f"Terraria backup ({server_id}) — status: {status}\nfiles: {files_backed}\npath: {selected_path}\nRepo: {repo_name}\nRun: {run_number}"
 
-# Telegram: ensure token + chat + user started bot conversation
 if TG_TOKEN and TG_CHAT:
     try:
         chat_id = resolve_chat_id(TG_TOKEN, TG_CHAT)
-        if not chat_id:
-            print("Telegram: could not resolve chat id, skipping")
-        else:
-            print("Telegram: sending to chat_id:", chat_id)
+        if chat_id:
+            print("Telegram: sending to", chat_id)
             send_telegram(TG_TOKEN, chat_id, msg)
-            print("Telegram: message sent")
+            print("Telegram: sent")
+        else:
+            print("Telegram: chat id not resolved, skipping")
     except Exception as e:
         print("Telegram send failed:", e, file=sys.stderr)
-
 else:
     print("Telegram secrets not set; skipping")
 
-# Discord
 if DISCORD_WEBHOOK:
     try:
         desc = f"status: {status}\nfiles: {files_backed}\npath: {selected_path}"
         send_discord(DISCORD_WEBHOOK, desc)
-        print("Discord: message sent")
+        print("Discord: sent")
     except Exception as e:
         print("Discord send failed:", e, file=sys.stderr)
 else:
