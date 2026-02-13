@@ -31,7 +31,7 @@ jobs:
           fi
           echo "$RCLONE_CONF_B64" | base64 -d > rclone.conf
           chmod 600 rclone.conf
-          echo "rclone.conf ready"
+          echo "✔️ rclone.conf ready"
 
       - name: Run backup (detect path, upload)
         id: run_backup
@@ -50,34 +50,29 @@ jobs:
           SFTP_PORT="${SFTP_PORT:-2022}"
           KEEP_DAYS="${KEEP_DAYS:-30}"
 
-          if [ -z "${SFTP_HOST:-}" ] || [ -z "${SFTP_USER:-}" ] || [ -z "${DRIVE_REMOTE:-}" ] || [ -z "${SERVER_ID:-}" ]; then
-            echo "Missing required secrets (SFTP_HOST/SFTP_USER/DRIVE_REMOTE/SERVER_ID)"
+          if [ -z "${SFTP_HOST}" ] || [ -z "${SFTP_USER}" ] || [ -z "${DRIVE_REMOTE}" ] || [ -z "${SERVER_ID}" ]; then
+            echo "❌ Required secrets missing"
             exit 1
           fi
 
-          # Ensure no stale remote
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
 
-          # Create temporary sftp remote (using password)
-          if [ -n "${SFTP_PASS:-}" ]; then
+          if [ -n "${SFTP_PASS}" ]; then
             rclone --config=rclone.conf config create sftp_tmp sftp \
               host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" pass "$SFTP_PASS"
           else
-            echo "No SFTP_PASS provided; cannot proceed"
+            echo "❌ TERRARIA_SFTP_PASS not set"
             exit 1
           fi
 
-          # Connection test
-          echo "Testing sftp_tmp connectivity..."
+          echo "📡 Testing sftp_tmp..."
           if ! rclone --config=rclone.conf lsf "sftp_tmp:" >/dev/null 2>&1; then
-            echo "ERROR: cannot list sftp_tmp: — connection/auth likely invalid"
-            rclone --config=rclone.conf lsd "sftp_tmp:" || true
+            echo "❌ Cannot list sftp_tmp"
             rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
             exit 1
           fi
           echo "✔️ sftp_tmp reachable"
 
-          # Candidate paths (REMOTE_PATH preferred)
           CANDIDATES=(
             "${REMOTE_PATH}"
             "saves/Worlds"
@@ -96,74 +91,49 @@ jobs:
           for p in "${CANDIDATES[@]}"; do
             if [ -z "${p}" ]; then
               TARGET="sftp_tmp:"
-              SHOW="(root)"
             else
               TARGET="sftp_tmp:${p}"
-              SHOW="${p}"
             fi
-            echo "Trying: ${SHOW}"
             MATCHES=$(rclone --config=rclone.conf lsf "${TARGET}" --include "*.wld" --include "*.wld.bak" 2>/dev/null || true)
             if [ -n "${MATCHES}" ]; then
               FOUND="${p}"
-              echo " → matches found in ${SHOW}"
               break
-            else
-              echo " → none"
             fi
           done
 
-          # Recursive fallback if nothing matched
           if [ -z "${FOUND}" ]; then
-            echo "No candidate matched — searching recursively (controlled)"
             FIRST=$(rclone --config=rclone.conf lsjson "sftp_tmp:" --recursive --files-only 2>/dev/null \
               | jq -r '.[] | select(.Path | test("\\.wld$")) | .Path' | head -n1 || true)
             if [ -n "${FIRST}" ]; then
               FOUND="$(dirname "${FIRST}")"
-              echo "Found .wld at ${FIRST}; using parent ${FOUND}"
             else
-              echo "❌ No .wld files found on sftp_tmp:"
+              echo "❌ No .wld found"
               rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
               echo "files=0" >> "$GITHUB_OUTPUT"
-              echo "path=" >> "$GITHUB_OUTPUT"
+              echo "path="  >> "$GITHUB_OUTPUT"
               exit 1
             fi
           fi
 
-          # Finalize selected path & count files
           SELECTED_TARGET="sftp_tmp:${FOUND}"
           SELECTED_PATH="${FOUND}"
+
           FINAL_COUNT=$(rclone --config=rclone.conf lsf "${SELECTED_TARGET}" --include "*.wld" --include "*.wld.bak" 2>/dev/null | sed '/^\s*$/d' | wc -l || true)
-          FINAL_COUNT="${FINAL_COUNT:-0}"
-          echo "Files to back up: ${FINAL_COUNT}"
 
-          if [ "${FINAL_COUNT}" -eq 0 ]; then
-            echo "No files to copy; cleaning and exiting"
-            rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
-            echo "files=0" >> "$GITHUB_OUTPUT"
-            echo "path=${SELECTED_PATH}" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
+          echo "files=${FINAL_COUNT:-0}" >> "$GITHUB_OUTPUT"
+          echo "path=${SELECTED_PATH}"  >> "$GITHUB_OUTPUT"
 
-          # Destinations & flags
           ARCHIVE="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
           LATEST="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
+
           RCLONE_FLAGS="--retries 5 --low-level-retries 10 --timeout 1m --transfers 1 --checkers 8 --progress -v"
 
-          echo "Copying to archive: ${ARCHIVE}"
-          rclone --config=rclone.conf copy "${SELECTED_TARGET}" "${ARCHIVE}" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs ${RCLONE_FLAGS}
+          rclone --config=rclone.conf copy "${SELECTED_TARGET}" "$ARCHIVE" --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
+          rclone --config=rclone.conf sync "${SELECTED_TARGET}" "$LATEST"       --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs $RCLONE_FLAGS
 
-          echo "Syncing latest -> ${LATEST}"
-          rclone --config=rclone.conf sync "${SELECTED_TARGET}" "${LATEST}" \
-            --include "*.wld" --include "*.wld.bak" --create-empty-src-dirs ${RCLONE_FLAGS}
-
-          echo "Pruning backups older than ${KEEP_DAYS} days..."
           rclone --config=rclone.conf delete "${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive" --min-age ${KEEP_DAYS}d || true
 
-          # Cleanup and outputs
           rclone --config=rclone.conf config delete sftp_tmp >/dev/null 2>&1 || true
-          echo "files=${FINAL_COUNT}" >> "$GITHUB_OUTPUT"
-          echo "path=${SELECTED_PATH}" >> "$GITHUB_OUTPUT"
           echo "✔️ Upload complete"
 
   notify:
@@ -171,12 +141,12 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Install python (for robust notifications)
+      - name: Install Python
         run: |
           sudo apt-get update -y
           sudo apt-get install -y python3
 
-      - name: Prepare notification variables
+      - name: Prepare notification vars
         run: |
           echo "backup_result=${{ needs.backup.result }}" >> $GITHUB_ENV
           echo "files_backed=${{ needs.backup.outputs.files }}" >> $GITHUB_ENV
@@ -185,11 +155,11 @@ jobs:
           echo "repo_name=${{ github.repository }}" >> $GITHUB_ENV
           echo "run_number=${{ github.run_number }}" >> $GITHUB_ENV
 
-      - name: Send notifications (Telegram + Discord) using Python
+      - name: Send Telegram + Discord notifications
         env:
           TG_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT:       ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISCORD_WEBHOOK:${{ secrets.DISCORD_WEBHOOK }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           python3 - <<'PY'
 import os, time, json, sys
@@ -225,63 +195,49 @@ def resolve_chat_id(token, chat):
         return None
     if chat.strip().lstrip("-").isdigit():
         return chat
-    q = chat if chat.startswith("@") else "@" + chat
+    q = chat if chat.startswith("@") else "@"+chat
     url = f"https://api.telegram.org/bot{token}/getChat"
-    data = parse.urlencode({"chat_id": q}).encode()
+    data = parse.urlencode({"chat_id":q}).encode()
     def call():
         resp = http_post(url, data=data)
         j = json.loads(resp.decode())
         if not j.get("ok"):
-            raise Exception("getChat failed: " + str(j))
+            raise Exception("getChat failed: "+ str(j))
         return str(j["result"]["id"])
     return retry_call(call, tries=4)
 
 def send_telegram(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode":"HTML"}
-    data = json.dumps(payload).encode()
-    headers = {"Content-Type":"application/json"}
+    payload={"chat_id":chat_id,"text":text,"parse_mode":"HTML"}
+    data=json.dumps(payload).encode()
+    headers={"Content-Type":"application/json"}
+    url=f"https://api.telegram.org/bot{token}/sendMessage"
     def call():
         resp = http_post(url, data=data, headers=headers)
         j = json.loads(resp.decode())
         if not j.get("ok"):
-            raise Exception("sendMessage failed: " + str(j))
+            raise Exception("sendMessage failed:"+str(j))
         return j
     return retry_call(call, tries=5)
 
-def send_discord(webhook, description):
-    payload = {"embeds":[{"title":f"Terraria backup: {server_id}", "description": description, "color":65280}]}
-    data = json.dumps(payload).encode()
-    headers = {"Content-Type":"application/json"}
-    def call():
-        resp = http_post(webhook, data=data, headers=headers)
-        return resp
-    return retry_call(call, tries=4)
-
-status = backup_result.upper()
-msg = f"Terraria backup ({server_id}) — status: {status}\nfiles: {files_backed}\npath: {selected_path}\nRepo: {repo_name}\nRun: {run_number}"
+msg=f"Terraria backup ({server_id}) — status: {backup_result.upper()}\nfiles: {files_backed}\npath: {selected_path}\nRepo: {repo_name}\nRun: {run_number}"
 
 if TG_TOKEN and TG_CHAT:
     try:
-        chat_id = resolve_chat_id(TG_TOKEN, TG_CHAT)
+        chat_id = resolve_chat_id(TG_TOKEN,TG_CHAT)
         if chat_id:
-            print("Telegram: sending to", chat_id)
             send_telegram(TG_TOKEN, chat_id, msg)
             print("Telegram: sent")
-        else:
-            print("Telegram: chat id not resolved, skipping")
     except Exception as e:
-        print("Telegram send failed:", e, file=sys.stderr)
-else:
-    print("Telegram secrets not set; skipping")
+        print("Telegram error:",e,file=sys.stderr)
 
 if DISCORD_WEBHOOK:
     try:
-        desc = f"status: {status}\nfiles: {files_backed}\npath: {selected_path}"
-        send_discord(DISCORD_WEBHOOK, desc)
+        desc=f"status: {backup_result}\nfiles:{files_backed}\npath:{selected_path}"
+        payload={"embeds":[{"title":f"Terraria backup: {server_id}","description": desc ,"color":65280}]}
+        data=json.dumps(payload).encode()
+        headers={"Content-Type":"application/json"}
+        request.urlopen(request.Request(DISCORD_WEBHOOK,data=data,headers=headers),timeout=15)
         print("Discord: sent")
     except Exception as e:
-        print("Discord send failed:", e, file=sys.stderr)
-else:
-    print("Discord webhook not set; skipping")
+        print("Discord error:",e,file=sys.stderr)
 PY
