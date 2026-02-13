@@ -25,10 +25,6 @@ jobs:
           RCLONE_CONF_B64: ${{ secrets.RCLONE_CONF }}
         run: |
           set -e
-          if [ -z "${RCLONE_CONF_B64:-}" ]; then
-            echo "RCLONE_CONF secret missing"
-            exit 1
-          fi
           echo "$RCLONE_CONF_B64" | base64 -d > rclone.conf
           chmod 600 rclone.conf
 
@@ -54,10 +50,7 @@ jobs:
           rclone --config=rclone.conf config create sftp_tmp sftp \
             host "$SFTP_HOST" user "$SFTP_USER" port "$SFTP_PORT" pass "$SFTP_PASS"
 
-          if ! rclone --config=rclone.conf lsf "sftp_tmp:" >/dev/null 2>&1; then
-            echo "SFTP connection failed"
-            exit 1
-          fi
+          rclone --config=rclone.conf lsf "sftp_tmp:" >/dev/null
 
           TARGET="sftp_tmp:${REMOTE_PATH}"
           COUNT=$(rclone --config=rclone.conf lsf "$TARGET" --include "*.wld" --include "*.wld.bak" 2>/dev/null | wc -l || true)
@@ -65,11 +58,6 @@ jobs:
 
           echo "files=${COUNT}" >> "$GITHUB_OUTPUT"
           echo "path=${REMOTE_PATH}" >> "$GITHUB_OUTPUT"
-
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No world files found"
-            exit 1
-          fi
 
           ARCHIVE="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/archive/$(date +%F_%H-%M-%S)"
           LATEST="${DRIVE_REMOTE}:terraria-backups/${SERVER_ID}/latest"
@@ -87,6 +75,11 @@ jobs:
     if: always()
 
     steps:
+      - name: Install curl
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl
+
       - name: Send Telegram notification
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -100,19 +93,6 @@ jobs:
             TEXT="Terraria backup ${SERVER_ID} status: ${RESULT} files: ${FILES} path: ${PATH}"
             curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
               -d "chat_id=${TG_CHAT}" \
-              -d "text=${TEXT}" > /dev/null
-          fi
-
-      - name: Send Discord notification
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          RESULT: ${{ needs.backup.result }}
-          FILES: ${{ needs.backup.outputs.files }}
-          PATH: ${{ needs.backup.outputs.path }}
-          SERVER_ID: ${{ secrets.SERVER_ID }}
-        run: |
-          if [ -n "${DISCORD_WEBHOOK:-}" ]; then
-            curl -s -H "Content-Type: application/json" \
-              -d "{\"content\":\"Terraria backup ${SERVER_ID} status: ${RESULT} files: ${FILES} path: ${PATH}\"}" \
-              "${DISCORD_WEBHOOK}" > /dev/null
+              -d "text=${TEXT}" \
+              || true
           fi
